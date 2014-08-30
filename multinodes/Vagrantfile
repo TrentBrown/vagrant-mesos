@@ -151,7 +151,7 @@ SCRIPT
                                    "#{ninfos[:master][0][:ip]}:5050"
                                  end,
                 :ip           => "#{ninfo[:ip]}",
-                :containerizers    => "docker,mesos"
+                :containerizers    => "docker,mesos",
                 :isolation    => "posix/cpu,posix/mem"    # Was "process"
               }
             }
