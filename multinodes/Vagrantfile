@@ -28,6 +28,7 @@ Vagrant.configure("2") do |config|
   [ninfos[:zk], ninfos[:master], ninfos[:slave]].flatten.each_with_index do |ninfo, i|
     config.vm.define ninfo[:hostname] do |cfg|
 
+      # VirtualBox
       cfg.vm.provider :virtualbox do |vb, override|
         override.vm.box = "opscode-ubuntu-14.04"
         override.vm.box_url = "http://opscode-vm-bento.s3.amazonaws.com/vagrant/virtualbox/opscode_ubuntu-14.04_chef-provisionerless.box"
@@ -50,6 +51,7 @@ Vagrant.configure("2") do |config|
         end
       end
 
+      # AWS
       cfg.vm.provider :aws do |aws, override|
         override.vm.box = "dummy"
         override.vm.box_url = "https://github.com/mitchellh/vagrant-aws/raw/master/dummy.box"
@@ -107,7 +109,13 @@ SCRIPT
 #       chef.log_level = :debug
         chef.add_recipe "apt"
         chef.add_recipe "mesos"
+        
+        # Suppress MOTD check for updates
+        cfg.vm.provision :shell, :inline => <<SCRIPT
+          touch ~/.hushlogin
+        SCRIPT
 
+        # Master
         if master?(ninfo[:hostname]) then
           chef.add_recipe "mesos::master"
           chef.json  = {
@@ -134,6 +142,8 @@ SCRIPT
               end
             }
           }
+        
+        # Slave
         elsif slave?(ninfo[:hostname]) then
           chef.add_recipe "docker::aufs"
           chef.add_recipe "docker::lxc"
@@ -151,11 +161,14 @@ SCRIPT
                                    "#{ninfos[:master][0][:ip]}:5050"
                                  end,
                 :ip           => "#{ninfo[:ip]}",
-                :containerizers    => "docker,mesos",
-                :isolation    => "posix/cpu,posix/mem"    # Was "process"
+                :executor_registration_timeout => "5mins",   # To allow time for image downloads
+                :containerizers => "docker,mesos",
+                :isolation    => "posix/cpu,posix/mem"
               }
             }
           }
+        
+        # Zookeeper
         elsif zk?(ninfo[:hostname]) then
           chef.json = {
             :mesos => {
@@ -169,6 +182,7 @@ SCRIPT
         end
       end
 
+      # Zookeeper
       if zk?(ninfo[:hostname]) then
         myid = (/zk([0-9]+)/.match ninfo[:hostname])[1]
         cfg.vm.provision :shell, :inline => <<SCRIPT
@@ -255,23 +269,56 @@ SCRIPT
         }
       end
 
-      if "#{conf["mesos_version"]}" >= "0.19.0"
-        marathon_version = "marathon-0.6.1"
-      elsif "#{conf["mesos_version"]}" >= "0.17.0"
-        marathon_version = "marathon-0.5.1"
-      else
-        marathon_version = "marathon-0.5.1_mesos-0.16.0"
-      end
-      marathon_download_url = "http://downloads.mesosphere.io/marathon/#{marathon_version}/#{marathon_version}.tgz"
-      cfg.vm.provision :shell, :inline => <<SCRIPT
-        apt-get -y install default-jre-headless unzip curl libcurl3
-        if [ ! -e /tmp/marathon.tgz ]; then
-          curl -sSfL #{marathon_download_url} --output /tmp/marathon.tgz
-          mkdir -p /opt && cd /opt && tar xzf /tmp/marathon.tgz
-        fi
-        kill -KILL `ps augwx | grep marathon | tr -s " " | cut -d' ' -f2`
-        LIBPROCESS_IP=#{marathon_ip} nohup /opt/#{marathon_version}/bin/start --master #{"zk://"+ninfos[:zk].map{|zk| zk[:ip]+":2181"}.join(",")+"/mesos"} --zk_hosts #{ninfos[:zk].map{|zk| zk[:ip]+":2181"}.join(",")} > /opt/#{marathon_version}/nohup.log 2> /opt/#{marathon_version}/nohup.log < /dev/null &
+      if "#{conf["mesos_version"]}" >= "0.20.0"
+      
+        # Until Marathon 0.7.0 is released, we must build the current head from source
+
+        cfg.vm.provision :shell, :inline => <<SCRIPT
+                    
+          # Install OpenJDK
+          sudo apt-get install -y openjdk-7-jdk
+          
+          # Install Git
+          sudo apt-get install -y git
+          
+          # Install Scala Build Tool
+          cd /tmp
+          wget http://dl.bintray.com/sbt/debian/sbt-0.13.5.deb
+          sudo dpkg -i sbt-0.13.5.deb
+          
+          # Build and install Marathon
+          git clone https://github.com/mesosphere/marathon.git
+          cd /tmp/marathon
+          sbt assembly
+          sudo mv /tmp/marathon/ /opt/
+          
+          # Start Marathon. TODO: Create an init script so that Marathon survives reboots
+          cd /opt/marathon
+          kill -KILL `ps augwx | grep marathon | tr -s " " | cut -d' ' -f2`
+          LIBPROCESS_IP=#{marathon_ip} nohup /opt/marathon/bin/start --master #{"zk://"+ninfos[:zk].map{|zk| zk[:ip]+":2181"}.join(",")+"/mesos"} --zk_hosts #{ninfos[:zk].map{|zk| zk[:ip]+":2181"}.join(",")} > /opt/marathon/nohup.log 2> /opt/marathon/nohup.log < /dev/null &
+          
 SCRIPT
+      else
+        if "#{conf["mesos_version"]}" >= "0.19.0"
+          marathon_version = "marathon-0.6.1"
+        elsif "#{conf["mesos_version"]}" >= "0.17.0"
+          marathon_version = "marathon-0.5.1"
+        else
+          marathon_version = "marathon-0.5.1_mesos-0.16.0"
+        end
+
+        marathon_download_url = "http://downloads.mesosphere.io/marathon/#{marathon_version}/#{marathon_version}.tgz"
+        cfg.vm.provision :shell, :inline => <<SCRIPT
+          apt-get -y install default-jre-headless unzip curl libcurl3
+          if [ ! -e /tmp/marathon.tgz ]; then
+            curl -sSfL #{marathon_download_url} --output /tmp/marathon.tgz
+            mkdir -p /opt && cd /opt && tar xzf /tmp/marathon.tgz
+          fi
+          kill -KILL `ps augwx | grep marathon | tr -s " " | cut -d' ' -f2`
+          LIBPROCESS_IP=#{marathon_ip} nohup /opt/#{marathon_version}/bin/start --master #{"zk://"+ninfos[:zk].map{|zk| zk[:ip]+":2181"}.join(",")+"/mesos"} --zk_hosts #{ninfos[:zk].map{|zk| zk[:ip]+":2181"}.join(",")} > /opt/#{marathon_version}/nohup.log 2> /opt/#{marathon_version}/nohup.log < /dev/null &
+SCRIPT
+      end
+      
     end
   end
 end
